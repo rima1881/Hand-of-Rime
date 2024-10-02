@@ -1,0 +1,179 @@
+import math
+
+from pydrake.all import MultibodyPlant
+from pydrake.all import RotationMatrix
+from pydrake.all import Parser
+from pydrake.all import Solve
+from pydrake.all import RigidTransform
+import numpy as np
+from pydrake.multibody.inverse_kinematics import InverseKinematics
+
+np.set_printoptions ( suppress = True, precision = 6 )
+
+URDF_WORLD_OFFSET_X = 12.498
+
+URDF_J6_ROTATION = np.array ( [
+        [  math.cos ( math.pi / 2.0), 0.0, math.sin ( math.pi / 2.0 ), 0.0 ],
+        [  0.0,                       1.0,                        0.0, 0.0 ],
+        [ -math.sin ( math.pi / 2.0), 0.0, math.cos ( math.pi / 2.0 ), 0.0 ],
+        [  0.0,                       0.0,                        0.0, 1.0 ] ] )
+
+
+URDF_J6_ROTATION_INV = np.linalg.inv ( URDF_J6_ROTATION )
+
+
+HOME = np.deg2rad([0.0, -13.612000465, 12.754300117, 0.0, 30.857599258, 0.0])
+
+RANDOM_POS = np.array([ 3.04676705 , 0.29143209 , -0.02131716 , -1.97426958 , -1.99391916 ,  0.61141654])
+
+SEC_HOME = np.array([ -5.26315790e-12 , -2.41441875e-01  , 2.30523678e-01 , 0 , 5.24514380e-01 ,  0])
+
+def initDrake(robotPath):
+
+    #   Drake initialization
+    sim_time_step = 0.01
+    plant = MultibodyPlant(sim_time_step)
+    parser = Parser(plant)
+
+    #   Read URDF File
+    f = open(robotPath, "r")
+    robot_urdf_string = f.read()
+    robot_urdf_string.replace("\n", "")
+
+    #   Add Robot model to plant
+    Parser(plant).AddModelsFromString(robot_urdf_string, "urdf")
+
+    #   Pining robot base
+    robot_base = plant.GetFrameByName("meca_base_link")
+    plant.WeldFrames(
+        plant.world_frame(),
+        robot_base,
+        RigidTransform.Identity()
+    )
+
+    plant.Finalize()
+
+    plant_context = plant.CreateDefaultContext()
+
+    return plant , plant_context
+
+def findRobotJoints(
+                    plant, plant_context,
+                    currentJointsPositions,
+                    destinationFlangePositionTransform,
+                    dt = 0.01,
+                    kinematicAccuracy = 1e-12):
+
+
+    plant.SetPositions(plant_context, currentJointsPositions)
+
+    #   TODO: extract the point and rotation out of the matrix
+    destinationFlangeTransform = np.matmul ( destinationFlangePositionTransform, URDF_J6_ROTATION_INV )
+    destinationFlangeTransform[0, 3] += URDF_WORLD_OFFSET_X
+    destinationFlangeTransform[:3, 3] /= 1000.0
+
+
+    p_aq = np.array(destinationFlangeTransform[:3, 3] )
+
+    p_AQ_lower = p_aq - kinematicAccuracy
+    p_AQ_upper = p_aq + kinematicAccuracy
+    desired_orientation = RotationMatrix(destinationFlangeTransform[:3, :3])
+
+    IK = InverseKinematics(plant, plant_context)
+
+    prog = IK.prog()
+    q = IK.q()
+
+    IK.AddOrientationConstraint(
+        plant.world_frame(),
+        desired_orientation,
+        plant.GetFrameByName("meca_axis_6_link"),
+        RotationMatrix(np.eye(3)),
+        1e-12
+    )
+
+    IK.AddPositionConstraint(
+        plant.GetFrameByName("meca_axis_6_link"),
+        [0, 0, 0],
+        plant.world_frame(),
+        p_AQ_lower,
+        p_AQ_upper
+    )
+
+    result = Solve(prog)
+
+    if result.is_success():
+        print("IK was successfully solved")
+        new_q = result.GetSolution(q)
+        plant.SetPositions(plant_context, new_q)
+
+        return new_q
+
+    else:
+        print("IK failed to solve")
+
+        return None
+
+
+def forwardKinematics(plant , plant_context , q):
+
+    plant.SetPositions(plant_context, q)
+
+    end_effector_transform = plant.CalcRelativeTransform(
+        plant_context,
+        plant.world_frame(),
+        plant.GetFrameByName('meca_axis_6_link')
+    ).GetAsMatrix4()
+
+    # convert of meter to millimeter
+    end_effector_transform [ :3, 3 ] *= 1000.0
+
+    # change based on world offset
+    end_effector_transform [ 0, 3 ] -= URDF_WORLD_OFFSET_X
+
+    # rotate in brainsight coordinates
+    end_effector_transform = np.matmul ( end_effector_transform, URDF_J6_ROTATION )
+
+    return end_effector_transform
+
+
+
+    # Step 4: Print the result
+    print("End-effector position and orientation:")
+    print(end_effector_transform)
+
+def generateRandomJointValue( plant , plant_context ):
+
+    upperLimits = plant.GetPositionUpperLimits()
+    lowerLimits = plant.GetPositionLowerLimits()
+
+    valid_positions = []
+    while len(valid_positions) < 100:
+        random_position = np.random.uniform(low=lowerLimits, high=upperLimits)
+        plant.SetPositions(plant_context, random_position)
+        if not plant.HasCollisions(plant_context):
+            valid_positions.append(random_position)
+    return valid_positions
+
+
+
+robot , robot_context = initDrake("robot.v3.model.urdf")
+
+#joints = generateRandomJointValue(robot , robot_context)
+
+transformHome = forwardKinematics(robot, robot_context , HOME)
+
+print(transformHome)
+
+newJointsHome = findRobotJoints(robot, robot_context , RANDOM_POS , transformHome)
+
+print(np.degrees(HOME))
+
+print( np.degrees( newJointsHome ))
+
+#   Getting Transform For Home
+newTrasformHome = forwardKinematics(robot, robot_context , newJointsHome)
+print(transformHome - newTrasformHome)
+
+
+
