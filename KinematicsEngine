@@ -1,0 +1,306 @@
+
+import numpy as np
+from pydrake.all import MultibodyPlant, RotationMatrix, Parser, Solve, RigidTransform
+from pydrake.multibody.inverse_kinematics import InverseKinematics
+import pinocchio as pin
+import pink
+import math
+
+URDF_WORLD_OFFSET_X = 12.498
+
+URDF_J6_ROTATION = np.array([
+        [math.cos(math.pi / 2.0),    0.0,   math.sin(math.pi / 2.0),  0.0],
+        [0.0,                        1.0,   0.0,                      0.0],
+        [-math.sin(math.pi / 2.0),   0.0,   math.cos(math.pi / 2.0),  0.0],
+        [0.0,                        0.0,   0.0,                      1.0]
+])
+
+
+URDF_J6_ROTATION_INV = np.linalg.inv(URDF_J6_ROTATION)
+
+
+# TODO
+# Should kill me
+def rotateAroundZ (transform: np.ndarray, rotationRadians: float) -> np.ndarray:
+
+    rotationOnlyTransform = np.copy ( transform )
+    rotationOnlyTransform [ :3, 3 ] = 0.0
+
+    appliedRotationTransform = np.array ( [
+        [ math.cos ( rotationRadians ), -math.sin ( rotationRadians ), 0.0, 0.0 ],
+        [ math.sin ( rotationRadians ),  math.cos ( rotationRadians ), 0.0, 0.0 ],
+        [                          0.0,                           0.0, 1.0, 0.0 ],
+        [                          0.0,                           0.0, 0.0, 1.0 ] ] )
+
+    assert appliedRotationTransform is not None
+
+    newTransform = np.matmul ( rotationOnlyTransform,  np.linalg.inv ( appliedRotationTransform ) )
+    newTransform [ :3, 3 ] = transform [ :3, 3 ]
+
+    return newTransform
+
+
+# TODO
+# Should kill me
+def convertToURFDWorld (input):
+    output = np.matmul(input, URDF_J6_ROTATION_INV)
+    output[0, 3] += URDF_WORLD_OFFSET_X
+    output[:3, 3] /= 1000.0
+    return output
+
+def convertFromURDFWorld(input):
+    print("nah sillah")
+
+class KinematicEngine:
+
+    def forwardKinematics(self, jointsInAngles: np.ndarray) -> np.ndarray:
+        pass
+
+    # Base Implementation for IK
+    def inverseKinematics(self, FlangeTransform, positionError, orientationError) -> (np.ndarray, bool):
+        pass
+
+    def inverseKinematicsIgnoreTwist(self,
+                                     FlangeTransform,
+                                     ToolCalibration,
+                                     positionError,
+                                     orientationError) -> (np.ndarray, bool):
+
+        toolTransform = np.matmul(FlangeTransform, ToolCalibration)
+        tentativeTwistAngles = np.radians(np.arange(0, 360, 30))
+
+        for angle in tentativeTwistAngles:
+
+            rotatedToolTransform = rotateAroundZ(toolTransform, angle)
+            rotatedFlangeTransform = np.matmul(rotatedToolTransform, np.linalg.inv(ToolCalibration))
+
+            solutionJointsDegrees, didInverseKinematicsConverge = self.inverseKinematics(rotatedFlangeTransform,
+                                                                                         positionError,
+                                                                                         orientationError)
+
+            if didInverseKinematicsConverge:
+                return solutionJointsDegrees, didInverseKinematicsConverge
+        return None, False
+
+
+class KinematicsEnginePink(KinematicEngine):
+
+    def __init__(self, urdfPath, lastJoint, damping, randomTimes, dt, homeJointsDegrees):
+        self.randomTimes = randomTimes
+        self.dt = dt
+        self.damping = damping
+        self.homeJointsRad = np.deg2rad(homeJointsDegrees)
+
+        self.model = pin.buildModelFromUrdf(urdfPath)
+        self.data = self.model.createData()
+        self.lastJoint = lastJoint
+
+    def forwardKinematics(self, jointsInAngles: np.ndarray) -> np.ndarray:
+        pin.forwardKinematics(self.model, self.data, jointsInAngles)
+        pin.updateFramePlacements(self.model, self.data)
+        goal = self.data.oMf[self.model.getFrameId(self.lastJoint)]
+
+        endEffectorTransform = goal.np
+
+        # convert of meter to millimeter
+        endEffectorTransform[:3, 3] *= 1000.0
+
+        # change based on world offset
+        endEffectorTransform[0, 3] -= URDF_WORLD_OFFSET_X
+
+        # rotate in brainsight coordinates
+        endEffectorTransform = np.matmul(endEffectorTransform, URDF_J6_ROTATION)
+
+        return endEffectorTransform
+
+    def inverseKinematics(self, FlangeTransform, positionError = 1e-6, orientationError = 1e-6) -> (np.ndarray, bool):
+
+        FlangeTransformInPink = convertToURFDWorld(FlangeTransform)
+        FlangeTransformGoal = pin.SE3(FlangeTransformInPink)
+
+        joints, hasSolution = self.inverseKinematicsAttemp(FlangeTransformGoal,
+                                                           self.homeJointsRad,
+                                                           positionError,
+                                                           orientationError)
+
+        if hasSolution:
+            return np.rad2deg(joints), True
+
+        upperLimits = self.model.upperPositionLimit
+        lowerLimits = self.model.lowerPositionLimit
+
+
+        # Limiting J1 Joint
+        lowerLimits[0] = -np.pi / 4
+        upperLimits[0] = np.pi / 4
+
+        for i in range(self.randomTimes):
+            randomInitJoints = np.random.uniform(low=lowerLimits, high=upperLimits)
+            joints, hasSolution = self.inverseKinematicsAttemp(FlangeTransformGoal, randomInitJoints)
+            if hasSolution:
+                return np.rad2deg(joints), True
+
+        return None, False
+
+    # TODO
+    # Error has to be fixed
+    # Tolerance has to be fixed
+    def inverseKinematicsAttemp(self,
+                                FlangeTransformGoal,
+                                qInit,
+                                positionError,
+                                orientationError) -> (np.ndarray, bool):
+
+        tolerance = 1e-6
+
+        task = pink.tasks.FrameTask(
+            frame=self.lastJoint,
+            position_cost=1.0,
+            orientation_cost=.75,
+        )
+
+        task.set_target(FlangeTransformGoal)
+
+        configuration = pink.configuration.Configuration(self.model, self.data, qInit)
+
+        for t in np.arange(0, 30, self.dt):
+            velocity = pink.solve_ik(configuration, (task,), self.dt, solver='quadprog', damping=self.damping)
+            configuration.integrate_inplace(velocity, self.dt)
+
+            tcp_pose = configuration.get_transform_frame_to_world(self.lastJoint)
+            error = pin.log(tcp_pose.actInv(FlangeTransformGoal)).vector
+            if np.linalg.norm(error[:3]) < tolerance and np.linalg.norm(error[3:]) < tolerance:
+                return configuration.q, True
+        return configuration.q, False
+
+
+class KinematicsEngineDrake(KinematicEngine):
+
+    def __init__(self, urdfPath, baseJoint, lastJoint, dt):
+        drakePlant = MultibodyPlant(dt)
+
+        robotUrdfAsString = open(urdfPath, "r").read()
+        robotUrdfAsString.replace("\n", "")
+
+        Parser(drakePlant).AddModelsFromString(robotUrdfAsString, "urdf")
+
+        # To prevent kinematic solutions where the robot floats in space,
+        # drake requires pinning down the robot base to a fixed position.
+        robot_base = drakePlant.GetFrameByName(baseJoint)
+        drakePlant.WeldFrames(
+            drakePlant.world_frame(),
+            robot_base,
+            RigidTransform.Identity()
+        )
+
+        drakePlant.Finalize()
+
+        drakePlantContext = drakePlant.CreateDefaultContext()
+
+        self.plant = drakePlant
+        self.context = drakePlantContext
+        self.lastJoint = lastJoint
+
+    def forwardKinematics(self, joints: np.ndarray):
+        self.plant.SetPositions(self.context, np.radians(joints))
+
+        end_effector_transform = self.plant.CalcRelativeTransform(
+            self.context,
+            self.plant.world_frame(),
+            self.plant.GetFrameByName(self.lastJoint)
+        ).GetAsMatrix4()
+
+        # convert of meter to millimeter
+        end_effector_transform[:3, 3] *= 1000.0
+
+        # change based on world offset
+        end_effector_transform[0, 3] -= URDF_WORLD_OFFSET_X
+
+        # rotate in brainsight coordinates
+        end_effector_transform = np.matmul(end_effector_transform, URDF_J6_ROTATION)
+
+        return end_effector_transform
+
+    def inverseKinematics(self,
+                          flangeTransform,
+                          positionError,
+                          orientationError):
+
+        flangeTransform = convertToURFDWorld(flangeTransform)
+
+        solutionJointsDegrees, didInverseKinematicsConverge = self.inverseKinematicsAttemp(
+            flangeTransform,
+            positionError,
+            orientationError,
+        )
+
+        # If inverse kinematics fails the first time, we try to solve a simpler problem, without the orientation constraints.
+        # Then we use this intermediate solution as the starting point (guess) for a second attempt.
+        # Tests show that this approach helps reduce the number of cases where inverse kinematics fails.
+        if not didInverseKinematicsConverge:
+            # Even though the inverse kinematics without orientation may fail,
+            # it might still succeed when using the failed result as the initial guess.
+            initialGuess, _ = self.inverseKinematicsAttemp(
+                flangeTransform,
+                addOrientattionConstraint=False
+            )
+
+            solutionJointsDegrees, didInverseKinematicsConverge = self.inverseKinematicsAttemp(
+                flangeTransform,
+                initialGuess=initialGuess
+            )
+
+        return solutionJointsDegrees, didInverseKinematicsConverge
+
+    def inverseKinematicsAttemp(self,
+                                flangeTransform: np.ndarray,
+                                positionError,
+                                orientationError,
+                                addOrientattionConstraint=True,
+                                initialGuess = None
+                                ):
+
+        destinationTranslation = np.array(flangeTransform[:3, 3])
+
+        translationLowerBound = destinationTranslation - positionError
+        translationUpperBound = destinationTranslation + positionError
+
+        desired_orientation = RotationMatrix(flangeTransform[:3, :3])
+
+        drakeInverseKinematics = InverseKinematics(self.plant, self.context)
+
+        # We might attempt to solve the IK without the orientation constraint
+        # to obtain an initial guess for the solution.
+        if addOrientattionConstraint:
+            drakeInverseKinematics.AddOrientationConstraint(
+                self.plant.world_frame(),
+                desired_orientation,
+                self.plant.GetFrameByName(self.lastJoint),
+                RotationMatrix(np.eye(3)),
+                orientationError
+            )
+
+        drakeInverseKinematics.AddPositionConstraint(
+            self.plant.GetFrameByName(self.lastJoint),
+            [0.0, 0.0, 0.0],
+            self.plant.world_frame(),
+            translationLowerBound,
+            translationUpperBound
+        )
+
+        drakeInverseKinematicsProgram = drakeInverseKinematics.prog()
+        drakeInverseKinematicsVariable = drakeInverseKinematics.q()
+
+        # Include the joint guesses if we have them available.
+        if initialGuess is not None:
+            drakeInverseKinematicsProgram.SetInitialGuess(drakeInverseKinematicsVariable, np.radians(initialGuess))
+
+        result = Solve(drakeInverseKinematicsProgram)
+
+        didInverseKinematicsConverge = result.is_success()
+
+        solutionJointsRadians = result.GetSolution(drakeInverseKinematicsVariable)
+        solutionJointsDegrees = np.degrees(solutionJointsRadians)
+
+        return solutionJointsDegrees, didInverseKinematicsConverge
+
