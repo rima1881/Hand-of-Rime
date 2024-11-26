@@ -114,6 +114,57 @@ class KinematicEngine:
 
         return None, False
 
+
+    def inverseKinematicsTrajectory(self,
+                                    flangeTransform,
+                                    toolCalibration,
+                                    positionError = 1e-6,
+                                    orientationError = 1e-6):
+
+        toolTransform = np.matmul(flangeTransform, toolCalibration)
+        tentativeTwistAngles = np.radians(np.arange(0, 360, 30))
+
+        pointsDistance = np.eye(4)
+        pointsDistance[2][3] = -1
+
+        for angle in tentativeTwistAngles:
+            rotatedToolTransform = rotateAroundZ(toolTransform, angle)
+
+            rotatedFlangeTransform = np.matmul(rotatedToolTransform, np.linalg.inv(toolCalibration))
+
+            solutionJointsDegrees, didInverseKinematicsConverge = self.inverseKinematics(rotatedFlangeTransform,
+                                                                                         positionError,
+                                                                                         orientationError)
+
+            prevSolutionJointsDegrees = np.copy(solutionJointsDegrees)
+            pointToolTransform = np.copy(rotatedToolTransform)
+
+            depth = 0
+            while didInverseKinematicsConverge:
+                pointToolTransform = np.matmul(pointToolTransform, pointsDistance)
+                pointFlangeTransform = np.matmul(pointToolTransform, np.linalg.inv(toolCalibration))
+
+                newSolutionJointsDegrees, didInverseKinematicsConverge = self.inverseKinematics(pointFlangeTransform,
+                                                                                                positionError,
+                                                                                                orientationError)
+
+
+                diffAngles = np.abs( prevSolutionJointsDegrees - newSolutionJointsDegrees )
+
+                if np.any(diffAngles > 5):
+                    break
+
+                if depth >= 20:
+                    return solutionJointsDegrees, True
+
+                prevSolutionJointsDegrees = newSolutionJointsDegrees
+                depth += 1
+
+        return None, False
+
+
+
+
 # https://github.com/stephane-caron/pink
 class KinematicsEnginePink(KinematicEngine):
 
