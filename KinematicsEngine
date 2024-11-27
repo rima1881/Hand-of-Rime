@@ -5,11 +5,18 @@ from pydrake.multibody.inverse_kinematics import InverseKinematics
 import pinocchio as pin
 import pink
 import math
+from VetRobotEmulatorCommon import DRAKE_ENGINE, PINK_ENGINE
+
+HOME_JOINTS = np.array ( [ 0.0000000, -13.6120005, 12.7543001, 0.0000000, 30.8575993, 0.0000000 ] )
+
+MECADEMIC_URDF_LAST_JOINT_NAME = "meca_axis_6_link"
+MECADEMIC_URDF_BASE_JOINT_NAME = "meca_base_link"
+
+DRAKE_SIM_TIME_STEP = 0.01
 
 
 # The origin of the URDF-based robot model includes an additional X-axis offset of 12.498mm compared to the DH-based robot model.
 URDF_WORLD_OFFSET_X = 12.498
-
 
 # In the URDF-based robot model the J6 frame is rotated 90 degrees around the Y axis.
 URDF_J6_ROTATION = np.array([
@@ -72,6 +79,7 @@ class KinematicEngine:
     def forwardKinematics(self, jointsInDegrees: np.ndarray) -> np.ndarray:
         pass
 
+
     """
         The most basic implementation for inverse kinematics, aimed at receiving a target transform
         and returning corresponding robot joint values. While inverse kinematics often has multiple 
@@ -82,8 +90,9 @@ class KinematicEngine:
         https://drake.mit.edu/doxygen_cxx/classdrake_1_1multibody_1_1_global_inverse_kinematics.html
         https://drake.mit.edu/doxygen_cxx/group__solvers.html
     """
-    def inverseKinematics(self, FlangeTransform, positionError, orientationError) -> (np.ndarray, bool):
+    def inverseKinematics(self, flangeTransform, positionError, orientationError) -> (np.ndarray, bool):
         pass
+
 
     """
         Most tools in VetRobot are needle-like, so maintaining a fixed orientation for the tool is unnecessary. 
@@ -92,18 +101,18 @@ class KinematicEngine:
         fact that adding tool to robot model is needed before changing constraints.
     """
     def inverseKinematicsIgnoreTwist(self,
-                                     FlangeTransform,
-                                     ToolCalibration,
+                                     flangeTransform,
+                                     toolCalibration,
                                      positionError = 1e-6,
                                      orientationError = 1e-6) -> (np.ndarray, bool):
 
-        toolTransform = np.matmul(FlangeTransform, ToolCalibration)
+        toolTransform = np.matmul(flangeTransform, toolCalibration)
         tentativeTwistAngles = np.radians(np.arange(0, 360, 30))
 
         for angle in tentativeTwistAngles:
 
             rotatedToolTransform = rotateAroundZ(toolTransform, angle)
-            rotatedFlangeTransform = np.matmul(rotatedToolTransform, np.linalg.inv(ToolCalibration))
+            rotatedFlangeTransform = np.matmul(rotatedToolTransform, np.linalg.inv(toolCalibration))
 
             solutionJointsDegrees, didInverseKinematicsConverge = self.inverseKinematics(rotatedFlangeTransform,
                                                                                          positionError,
@@ -115,17 +124,55 @@ class KinematicEngine:
         return None, False
 
 
-    def inverseKinematicsTrajectory(self,
-                                    flangeTransform,
-                                    toolCalibration,
-                                    positionError = 1e-6,
-                                    orientationError = 1e-6):
+    """
+        In the alignment step, BrainSight prepares the VetRobot for injection. This function tests various adjustments
+        and thoroughly checks the joint angles to ensure they don't change excessively. During the injection,
+        it's crucial that the robot avoids erratic movements, as they could harm the subject.
+
+        Currently, to prevent such movements, a 5-degree difference in angles is imposed to ensure the movements
+        remain safe.
+    """
+    # TODO Take depth out
+    def inverseKinematicForInjection(self,
+                                     flangeTransform,
+                                     toolCalibration,
+                                     positionError = 1e-6,
+                                     orientationError = 1e-6):
+
+        injectionStep = lambda t: [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, -t],
+            [0, 0, 0, 1]
+        ]
+
+        depth = 20
+
+        newSolutionJointsDegrees, tLimit = self.inverseKinematicForPath(
+            flangeTransform,
+            toolCalibration,
+            injectionStep,
+            depth,
+            positionError,
+            orientationError
+        )
+
+        return newSolutionJointsDegrees, tLimit >= depth
+
+
+    def inverseKinematicForPath(self,
+                                flangeTransform,
+                                toolCalibration,
+                                stepMotion,
+                                stepNum,
+                                positionError = 1e-6,
+                                orientationError = 1e-6):
 
         toolTransform = np.matmul(flangeTransform, toolCalibration)
         tentativeTwistAngles = np.radians(np.arange(0, 360, 30))
 
-        pointsDistance = np.eye(4)
-        pointsDistance[2][3] = -1
+        maxT = 0
+        bestJoints = None
 
         for angle in tentativeTwistAngles:
             rotatedToolTransform = rotateAroundZ(toolTransform, angle)
@@ -136,12 +183,14 @@ class KinematicEngine:
                                                                                          positionError,
                                                                                          orientationError)
 
-            prevSolutionJointsDegrees = np.copy(solutionJointsDegrees)
-            pointToolTransform = np.copy(rotatedToolTransform)
+            if not didInverseKinematicsConverge:
+                continue
 
-            depth = 0
-            while didInverseKinematicsConverge:
-                pointToolTransform = np.matmul(pointToolTransform, pointsDistance)
+            prevSolutionJointsDegrees = np.copy(solutionJointsDegrees)
+
+            t = 0
+            while True:
+                pointToolTransform = np.matmul(rotatedToolTransform, stepMotion(t))
                 pointFlangeTransform = np.matmul(pointToolTransform, np.linalg.inv(toolCalibration))
 
                 newSolutionJointsDegrees, didInverseKinematicsConverge = self.inverseKinematics(pointFlangeTransform,
@@ -149,20 +198,38 @@ class KinematicEngine:
                                                                                                 orientationError)
 
 
-                diffAngles = np.abs( prevSolutionJointsDegrees - newSolutionJointsDegrees )
-
-                if np.any(diffAngles > 5):
+                if not didInverseKinematicsConverge:
                     break
 
-                if depth >= 20:
-                    return solutionJointsDegrees, True
+                diffAnglesDegrees = np.abs( prevSolutionJointsDegrees - newSolutionJointsDegrees )
+
+                if np.any(diffAnglesDegrees > 5):
+                    break
+
+                if t >= stepNum:
+                    return solutionJointsDegrees, t
 
                 prevSolutionJointsDegrees = newSolutionJointsDegrees
-                depth += 1
+                t += 1
 
-        return None, False
+            maxT = t
+            bestJoints = np.copy(solutionJointsDegrees)
+
+        return bestJoints, maxT
 
 
+    def linearJointsKinematic(self, joints, toolCalibration, stepMotion, t):
+
+        baseFlangeTransform = self.forwardKinematics(joints)
+        baseToolTransform = np.matmul(baseFlangeTransform, toolCalibration)
+
+        destinationToolTransform = np.matmul( baseToolTransform, stepMotion(t) )
+        destinationFlangeTransform = np.matmul( destinationToolTransform, np.linalg.inv(toolCalibration) )
+
+        sol, suc = self.inverseKinematics(destinationFlangeTransform)
+        if suc:
+            return sol
+        return None
 
 
 # https://github.com/stephane-caron/pink
@@ -181,6 +248,7 @@ class KinematicsEnginePink(KinematicEngine):
 
     def forwardKinematics(self, jointsInDegrees: np.ndarray) -> np.ndarray:
         pin.forwardKinematics(self.model, self.data, np.radians(jointsInDegrees))
+        pin.updateFramePlacements(self.model, self.data)
         goal = self.data.oMf[self.model.getFrameId(self.lastJoint)]
 
         endEffectorTransformMillimeter = convertFromURDFWorld(goal.np)
@@ -200,9 +268,9 @@ class KinematicsEnginePink(KinematicEngine):
         TODOs:
             - Exploring methods to tune variables for improving algorithm speed.
     """
-    def inverseKinematics(self, FlangeTransform, positionError = 1e-6, orientationError = 1e-6) -> (np.ndarray, bool):
+    def inverseKinematics(self, flangeTransform, positionError = 1e-6, orientationError = 1e-6) -> (np.ndarray, bool):
 
-        FlangeTransformInPink = convertToURFDWorld(FlangeTransform)
+        FlangeTransformInPink = convertToURFDWorld(flangeTransform)
         flangeTransformGoal = pin.SE3(FlangeTransformInPink)
 
         joints, hasSolution = self.inverseKinematicsAttempt(flangeTransformGoal,
@@ -264,7 +332,7 @@ class KinematicsEnginePink(KinematicEngine):
             if np.linalg.norm(error[:3]) < tolerance and np.linalg.norm(error[3:]) < tolerance:
                 return configuration.q, True
 
-        return configuration.q, False
+        return None, False
 
 
 # https://drake.mit.edu/
@@ -414,3 +482,11 @@ class KinematicsEngineDrake(KinematicEngine):
 
         return solutionJointsDegrees, didInverseKinematicsConverge
 
+
+def createEngine( engineType, urdfPath ):
+
+    if engineType == DRAKE_ENGINE:
+        return KinematicsEngineDrake(urdfPath, MECADEMIC_URDF_BASE_JOINT_NAME, MECADEMIC_URDF_LAST_JOINT_NAME, DRAKE_SIM_TIME_STEP)
+
+    if engineType == PINK_ENGINE:
+        return KinematicsEnginePink(urdfPath, MECADEMIC_URDF_LAST_JOINT_NAME, 1e-12, 10, 1, HOME_JOINTS )
